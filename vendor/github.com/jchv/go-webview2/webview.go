@@ -64,6 +64,7 @@ type WindowOptions struct {
 	Height uint
 	IconId uint
 	Center bool
+	Hidden bool // Start window hidden (for tray apps)
 }
 
 type WebViewOptions struct {
@@ -306,7 +307,12 @@ func (w *webview) CreateWithOptions(opts WindowOptions) bool {
 	}
 
 	var posX, posY uint
-	if opts.Center {
+	if opts.Hidden {
+		// Position window off-screen initially for hidden start
+		// This allows proper WebView2 embedding while keeping window invisible
+		posX = 32000
+		posY = 32000
+	} else if opts.Center {
 		// get screen size
 		screenWidth, _, _ := w32.User32GetSystemMetrics.Call(w32.SM_CXSCREEN)
 		screenHeight, _, _ := w32.User32GetSystemMetrics.Call(w32.SM_CYSCREEN)
@@ -319,8 +325,14 @@ func (w *webview) CreateWithOptions(opts WindowOptions) bool {
 		posY = w32.CW_USEDEFAULT
 	}
 
+	// Use WS_EX_TOOLWINDOW for hidden windows to avoid taskbar flash
+	var exStyle uintptr = 0
+	if opts.Hidden {
+		exStyle = w32.WSEXToolWindow
+	}
+
 	w.hwnd, _, _ = w32.User32CreateWindowExW.Call(
-		0,
+		exStyle,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
 		0xCF0000, // WS_OVERLAPPEDWINDOW
@@ -335,9 +347,12 @@ func (w *webview) CreateWithOptions(opts WindowOptions) bool {
 	)
 	setWindowContext(w.hwnd, w)
 
+	// Always show window for proper WebView2 embedding
 	_, _, _ = w32.User32ShowWindow.Call(w.hwnd, w32.SWShow)
 	_, _, _ = w32.User32UpdateWindow.Call(w.hwnd)
-	_, _, _ = w32.User32SetFocus.Call(w.hwnd)
+	if !opts.Hidden {
+		_, _, _ = w32.User32SetFocus.Call(w.hwnd)
+	}
 
 	if !w.browser.Embed(w.hwnd) {
 		return false

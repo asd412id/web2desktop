@@ -35,6 +35,7 @@ var (
 	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
 	procFindWindowW              = user32.NewProc("FindWindowW")
 	procSendMessageW             = user32.NewProc("SendMessageW")
+	procPostMessageW             = user32.NewProc("PostMessageW")
 	procLoadImageW               = user32.NewProc("LoadImageW")
 	procShowWindow               = user32.NewProc("ShowWindow")
 	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
@@ -46,6 +47,9 @@ var (
 	procDestroyIcon              = user32.NewProc("DestroyIcon")
 	procGetIconInfo              = user32.NewProc("GetIconInfo")
 	procGetDIBits                = user32.NewProc("GetDIBits")
+	procGetClientRect            = user32.NewProc("GetClientRect")
+	procGetSystemMetrics         = user32.NewProc("GetSystemMetrics")
+	procGetWindowRect            = user32.NewProc("GetWindowRect")
 	procSetWindowPos             = user32.NewProc("SetWindowPos")
 	procGetMonitorInfoW          = user32.NewProc("GetMonitorInfoW")
 	procMonitorFromWindow        = user32.NewProc("MonitorFromWindow")
@@ -79,6 +83,7 @@ const (
 	WM_SETICON     = 0x0080
 	WM_CLOSE       = 0x0010
 	WM_SYSCOMMAND  = 0x0112
+	WM_SIZE        = 0x0005
 	WM_USER        = 0x0400
 	WM_APP_SHOW    = WM_USER + 100 // Custom message to show window
 	SC_MINIMIZE    = 0xF020
@@ -96,13 +101,25 @@ const (
 	GWL_STYLE      = -16
 	GWL_EXSTYLE    = -20
 
+	// SetWindowPos flags
+	SWP_FRAMECHANGED = 0x0020
+	SWP_NOMOVE       = 0x0002
+	SWP_NOSIZE       = 0x0001
+	SWP_NOZORDER     = 0x0004
+
 	// Window styles
 	WS_OVERLAPPEDWINDOW = 0x00CF0000
 	WS_POPUP            = 0x80000000
 	WS_VISIBLE          = 0x10000000
 
 	// Extended window styles
-	WS_EX_TOPMOST = 0x00000008
+	WS_EX_TOPMOST    = 0x00000008
+	WS_EX_TOOLWINDOW = 0x00000080
+	WS_EX_APPWINDOW  = 0x00040000
+
+	// GetSystemMetrics
+	SM_CXSCREEN = 0
+	SM_CYSCREEN = 1
 
 	DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 	DWMWA_CAPTION_COLOR           = 35
@@ -322,6 +339,9 @@ func onTrayExit() {
 func runWebView() {
 	cfg := appConfig
 
+	// Determine if should start hidden (for tray apps starting minimized)
+	shouldStartHidden := cfg.EnableTray && (cfg.StartMinimized || startedFromStartup)
+
 	// Buat webview
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug:     !cfg.DisableDevTools,
@@ -330,7 +350,8 @@ func runWebView() {
 			Title:  cfg.Title,
 			Width:  uint(cfg.Width),
 			Height: uint(cfg.Height),
-			Center: true,
+			Center: !shouldStartHidden, // Don't center if hidden (will be off-screen)
+			Hidden: shouldStartHidden,  // Start off-screen to prevent window flash
 		},
 	})
 	if w == nil {
@@ -343,6 +364,12 @@ func runWebView() {
 
 	mainWindow = w
 	mainHwnd = uintptr(w.Window())
+
+	// If started hidden, hide the window now (it was shown off-screen for proper embedding)
+	if shouldStartHidden {
+		procShowWindow.Call(mainHwnd, SW_HIDE)
+		isWindowHidden = true
+	}
 
 	// Set window icon
 	setWindowIcon(mainHwnd)
@@ -358,11 +385,6 @@ func runWebView() {
 	// - Single instance (to handle WM_APP_SHOW from other instances)
 	if (cfg.EnableTray && (cfg.CloseToTray || cfg.MinimizeToTray)) || cfg.SingleInstance {
 		subclassWindow(mainHwnd)
-	}
-
-	// Start minimized to tray if configured OR if started from Windows startup
-	if cfg.EnableTray && (cfg.StartMinimized || startedFromStartup) {
-		hideMainWindow()
 	}
 
 	// Apply window state: fullscreen or maximized (only if not starting minimized)
@@ -485,13 +507,30 @@ func showMainWindow() {
 	}
 
 	if isWindowHidden {
-		// Window is hidden (in tray), show it
+		// If window was started with WS_EX_TOOLWINDOW (no taskbar), fix the extended style
+		// Remove WS_EX_TOOLWINDOW and add WS_EX_APPWINDOW to show in taskbar
+		const gwlExStyle = ^uintptr(19) // -20 as uintptr
+		exStyle, _, _ := procGetWindowLongPtrW.Call(mainHwnd, gwlExStyle)
+		exStyle = exStyle &^ WS_EX_TOOLWINDOW // Remove TOOLWINDOW
+		exStyle = exStyle | WS_EX_APPWINDOW   // Add APPWINDOW
+		procSetWindowLongPtrW.Call(mainHwnd, gwlExStyle, exStyle)
+
+		// Determine if we should maximize
+		shouldMaximize := isFullscreenMode || wasMaximized || appConfig.StartMaximized
+
+		// Only center window if NOT going to maximize/fullscreen
+		// Maximize will handle positioning itself
+		if !shouldMaximize {
+			centerWindow(mainHwnd)
+		}
+
+		// Show window
 		procShowWindow.Call(mainHwnd, SW_SHOW)
 
 		// Restore to correct state: fullscreen, maximized, or normal
 		if isFullscreenMode {
 			setFullscreen(mainHwnd, true)
-		} else if wasMaximized || appConfig.StartMaximized {
+		} else if shouldMaximize {
 			procShowWindow.Call(mainHwnd, SW_MAXIMIZE)
 		} else {
 			procShowWindow.Call(mainHwnd, SW_RESTORE)
@@ -510,6 +549,25 @@ func showMainWindow() {
 
 	// Force bring window to foreground
 	bringWindowToFront(mainHwnd)
+}
+
+// centerWindow moves a window to the center of the screen
+func centerWindow(hwnd uintptr) {
+	var rect struct {
+		Left, Top, Right, Bottom int32
+	}
+	procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&rect)))
+
+	windowWidth := rect.Right - rect.Left
+	windowHeight := rect.Bottom - rect.Top
+
+	screenWidth, _, _ := procGetSystemMetrics.Call(SM_CXSCREEN)
+	screenHeight, _, _ := procGetSystemMetrics.Call(SM_CYSCREEN)
+
+	posX := (int32(screenWidth) - windowWidth) / 2
+	posY := (int32(screenHeight) - windowHeight) / 2
+
+	procSetWindowPos.Call(hwnd, 0, uintptr(posX), uintptr(posY), 0, 0, SWP_NOSIZE|SWP_NOZORDER)
 }
 
 // bringWindowToFront forces window to foreground using multiple techniques

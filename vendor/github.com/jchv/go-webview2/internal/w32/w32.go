@@ -115,6 +115,11 @@ const (
 )
 
 const (
+	WSEXToolWindow = 0x00000080 // Window won't appear in taskbar
+	WSEXAppWindow  = 0x00040000 // Window will appear in taskbar
+)
+
+const (
 	WAInactive    = 0
 	WAActive      = 1
 	WAActiveClick = 2
