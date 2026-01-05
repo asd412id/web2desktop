@@ -72,6 +72,8 @@ const (
 	WM_SETICON     = 0x0080
 	WM_CLOSE       = 0x0010
 	WM_SYSCOMMAND  = 0x0112
+	WM_USER        = 0x0400
+	WM_APP_SHOW    = WM_USER + 100 // Custom message to show window
 	SC_MINIMIZE    = 0xF020
 	SC_CLOSE       = 0xF060
 	ICON_SMALL     = 0
@@ -307,8 +309,11 @@ func runWebView() {
 		setTitleBarColor(mainHwnd, cfg.TitleBarColor)
 	}
 
-	// If close to tray is enabled, subclass the window to intercept close
-	if cfg.EnableTray && cfg.CloseToTray {
+	// Subclass window if we need to intercept messages:
+	// - Close to tray
+	// - Minimize to tray
+	// - Single instance (to handle WM_APP_SHOW from other instances)
+	if (cfg.EnableTray && (cfg.CloseToTray || cfg.MinimizeToTray)) || cfg.SingleInstance {
 		subclassWindow(mainHwnd)
 	}
 
@@ -373,14 +378,26 @@ func runWebView() {
 
 // Window procedure for intercepting close
 func customWndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	// Handle custom show message from another instance
+	if msg == WM_APP_SHOW {
+		// Use goroutine to avoid blocking window procedure
+		go func() {
+			showMainWindow()
+		}()
+		return 0
+	}
+
 	if msg == WM_SYSCOMMAND {
+		// SC command is in low-order word of wParam
+		cmd := wParam & 0xFFF0
+
 		// Intercept minimize
-		if wParam == SC_MINIMIZE && appConfig.MinimizeToTray {
+		if cmd == SC_MINIMIZE && appConfig.MinimizeToTray {
 			hideMainWindow()
 			return 0
 		}
 		// Intercept close
-		if wParam == SC_CLOSE && appConfig.CloseToTray && !shouldReallyQuit {
+		if cmd == SC_CLOSE && appConfig.CloseToTray && !shouldReallyQuit {
 			hideMainWindow()
 			return 0
 		}
@@ -410,22 +427,35 @@ func showMainWindow() {
 	windowMutex.Lock()
 	defer windowMutex.Unlock()
 
-	if mainHwnd == 0 || !isWindowHidden {
+	if mainHwnd == 0 {
 		return
 	}
-	procShowWindow.Call(mainHwnd, SW_SHOW)
 
-	// Restore to correct state: fullscreen, maximized, or normal
-	if isFullscreenMode {
-		setFullscreen(mainHwnd, true)
-	} else if wasMaximized || appConfig.StartMaximized {
-		procShowWindow.Call(mainHwnd, SW_MAXIMIZE)
+	if isWindowHidden {
+		// Window is hidden (in tray), show it
+		procShowWindow.Call(mainHwnd, SW_SHOW)
+
+		// Restore to correct state: fullscreen, maximized, or normal
+		if isFullscreenMode {
+			setFullscreen(mainHwnd, true)
+		} else if wasMaximized || appConfig.StartMaximized {
+			procShowWindow.Call(mainHwnd, SW_MAXIMIZE)
+		} else {
+			procShowWindow.Call(mainHwnd, SW_RESTORE)
+		}
+		isWindowHidden = false
 	} else {
-		procShowWindow.Call(mainHwnd, SW_RESTORE)
+		// Window is visible, just restore if minimized and bring to front
+		// Check if currently maximized to preserve state
+		isMaximized, _, _ := procIsZoomed.Call(mainHwnd)
+		if isMaximized != 0 || wasMaximized || appConfig.StartMaximized {
+			procShowWindow.Call(mainHwnd, SW_MAXIMIZE)
+		} else {
+			procShowWindow.Call(mainHwnd, SW_RESTORE)
+		}
 	}
 
 	procSetForegroundWindow.Call(mainHwnd)
-	isWindowHidden = false
 }
 
 func hideMainWindow() {
@@ -1170,9 +1200,11 @@ func focusExistingWindow(title string) {
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	hwnd, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
 	if hwnd != 0 {
-		// First show the window (in case it's hidden in tray)
-		procShowWindow.Call(hwnd, SW_SHOW)
-		procShowWindow.Call(hwnd, SW_RESTORE)
+		// Send custom message to the existing window to show itself
+		// This allows the main instance to handle showing with correct state (maximized/fullscreen)
+		procSendMessageW.Call(hwnd, WM_APP_SHOW, 0, 0)
+
+		// Also set foreground as backup
 		procSetForegroundWindow.Call(hwnd)
 	}
 }
