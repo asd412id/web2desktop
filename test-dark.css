@@ -1,0 +1,7 @@
+/* Custom dark theme for testing */
+body {
+    filter: invert(1) hue-rotate(180deg) !important;
+}
+img, video, picture {
+    filter: invert(1) hue-rotate(180deg) !important;
+}
