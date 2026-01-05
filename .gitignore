@@ -21,9 +21,6 @@ coverage.html
 go.work
 go.work.sum
 
-# Dependency directories
-vendor/
-
 # IDE and editor files
 .idea/
 .vscode/
@@ -41,6 +38,7 @@ debug/
 tmp/
 temp/
 *.tmp
+nul
 
 # Environment files
 .env
@@ -52,3 +50,8 @@ internal/generator/stubs/*.exe
 
 # Downloaded icons cache
 *.ico.tmp
+
+# Test files
+test-*.css
+test-*.js
+test-*.ico

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,28 +26,34 @@ import (
 )
 
 var (
-	kernel32            = syscall.NewLazyDLL("kernel32.dll")
-	procCreateMutex     = kernel32.NewProc("CreateMutexW")
-	procGetModuleHandle = kernel32.NewProc("GetModuleHandleW")
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutex        = kernel32.NewProc("CreateMutexW")
+	procGetModuleHandle    = kernel32.NewProc("GetModuleHandleW")
+	procGetCurrentThreadId = kernel32.NewProc("GetCurrentThreadId")
 
-	user32                  = syscall.NewLazyDLL("user32.dll")
-	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procFindWindowW         = user32.NewProc("FindWindowW")
-	procSendMessageW        = user32.NewProc("SendMessageW")
-	procLoadImageW          = user32.NewProc("LoadImageW")
-	procShowWindow          = user32.NewProc("ShowWindow")
-	procIsWindowVisible     = user32.NewProc("IsWindowVisible")
-	procIsZoomed            = user32.NewProc("IsZoomed")
-	procSetWindowLongPtrW   = user32.NewProc("SetWindowLongPtrW")
-	procGetWindowLongPtrW   = user32.NewProc("GetWindowLongPtrW")
-	procCallWindowProcW     = user32.NewProc("CallWindowProcW")
-	procDefWindowProcW      = user32.NewProc("DefWindowProcW")
-	procDestroyIcon         = user32.NewProc("DestroyIcon")
-	procGetIconInfo         = user32.NewProc("GetIconInfo")
-	procGetDIBits           = user32.NewProc("GetDIBits")
-	procSetWindowPos        = user32.NewProc("SetWindowPos")
-	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
-	procMonitorFromWindow   = user32.NewProc("MonitorFromWindow")
+	user32                       = syscall.NewLazyDLL("user32.dll")
+	procSetForegroundWindow      = user32.NewProc("SetForegroundWindow")
+	procFindWindowW              = user32.NewProc("FindWindowW")
+	procSendMessageW             = user32.NewProc("SendMessageW")
+	procLoadImageW               = user32.NewProc("LoadImageW")
+	procShowWindow               = user32.NewProc("ShowWindow")
+	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
+	procIsZoomed                 = user32.NewProc("IsZoomed")
+	procSetWindowLongPtrW        = user32.NewProc("SetWindowLongPtrW")
+	procGetWindowLongPtrW        = user32.NewProc("GetWindowLongPtrW")
+	procCallWindowProcW          = user32.NewProc("CallWindowProcW")
+	procDefWindowProcW           = user32.NewProc("DefWindowProcW")
+	procDestroyIcon              = user32.NewProc("DestroyIcon")
+	procGetIconInfo              = user32.NewProc("GetIconInfo")
+	procGetDIBits                = user32.NewProc("GetDIBits")
+	procSetWindowPos             = user32.NewProc("SetWindowPos")
+	procGetMonitorInfoW          = user32.NewProc("GetMonitorInfoW")
+	procMonitorFromWindow        = user32.NewProc("MonitorFromWindow")
+	procGetForegroundWindow      = user32.NewProc("GetForegroundWindow")
+	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	procAttachThreadInput        = user32.NewProc("AttachThreadInput")
+	procBringWindowToTop         = user32.NewProc("BringWindowToTop")
+	procSetFocus                 = user32.NewProc("SetFocus")
 
 	shell32                                     = syscall.NewLazyDLL("shell32.dll")
 	procExtractIconEx                           = shell32.NewProc("ExtractIconExW")
@@ -122,6 +129,9 @@ var (
 )
 
 func main() {
+	// Debug log all startup arguments
+	debugLog("=== App started with args: %v ===", os.Args)
+
 	// Check for special arguments
 	var showWindow bool
 	var notifId string
@@ -130,24 +140,44 @@ func main() {
 		switch {
 		case arg == "--show" || arg == "/show":
 			showWindow = true
+			debugLog("Found --show flag")
 		case arg == "--startup" || arg == "/startup":
 			// Started from Windows startup - should start minimized to tray
 			startedFromStartup = true
+			debugLog("Found --startup flag")
 		case strings.HasPrefix(arg, "--notif-id="):
 			notifId = strings.TrimPrefix(arg, "--notif-id=")
 			showWindow = true
+			debugLog("Found --notif-id=%s", notifId)
+		case strings.HasPrefix(arg, "w2app://"):
+			// Parse protocol URL: w2app://notification?id=123
+			debugLog("Found protocol URL: %s", arg)
+			if parsedURL, err := url.Parse(arg); err == nil {
+				if parsedURL.Host == "notification" {
+					notifId = parsedURL.Query().Get("id")
+					showWindow = true
+					debugLog("Parsed notification ID from protocol URL: %s", notifId)
+				}
+			} else {
+				debugLog("Failed to parse protocol URL: %v", err)
+			}
 		}
 	}
 
 	// Handle show/notification click - focus existing window and optionally trigger callback
 	if showWindow {
+		debugLog("showWindow=true, reading config...")
 		cfg, err := readEmbeddedConfig()
 		if err == nil && cfg.Title != "" {
+			debugLog("Focusing existing window: %s", cfg.Title)
 			focusExistingWindow(cfg.Title)
 			if notifId != "" {
 				// Send notification click to existing instance via window message
+				debugLog("Sending notification click for id=%s", notifId)
 				sendNotificationClick(cfg.Title, notifId)
 			}
+		} else {
+			debugLog("Failed to read config or empty title: err=%v", err)
 		}
 		return
 	}
@@ -169,7 +199,12 @@ func main() {
 	// Single instance check
 	if cfg.SingleInstance {
 		if !acquireLock(cfg.Title) {
+			debugLog("Another instance running, focusing existing window")
 			focusExistingWindow(cfg.Title)
+			// Check if there's a pending notification click (from toast activation)
+			if cfg.EnableNotification {
+				handlePendingNotificationClick(cfg.Title)
+			}
 			return
 		}
 	}
@@ -190,6 +225,14 @@ func main() {
 	// Setup AppUserModelID for toast notifications (must be done early)
 	appUserModelID = generateAppUserModelID(cfg.Title)
 	setProcessAppUserModelID(appUserModelID)
+
+	// Register custom protocol for toast activation
+	if cfg.EnableNotification {
+		exePath, _ := os.Executable()
+		if err := registerProtocol("w2app", exePath); err != nil {
+			debugLog("Warning: failed to register protocol: %v", err)
+		}
+	}
 
 	// Create Start Menu shortcut with AppUserModelID (required for toast notifications)
 	if cfg.EnableNotification {
@@ -339,17 +382,26 @@ func runWebView() {
 
 	w.Bind("toggleFullscreen", func() {})
 
+	// Bind notification functions
 	if cfg.EnableNotification {
-		w.Bind("_w2appShowNotification", func(title, body, icon, notifId, tag string) {
-			showNativeNotification(title, body, icon, notifId, tag)
+		// Function to show native toast with app icon
+		w.Bind("w2appNotify", func(title, body, icon, notifId, tag string) {
+			debugLog("w2appNotify: title=%s, body=%s, id=%s", title, body, notifId)
+			go showNativeNotification(title, body, icon, notifId, tag)
+		})
+
+		// Function to focus/show window
+		w.Bind("w2appFocusWindow", func() {
+			debugLog("w2appFocusWindow called")
+			showMainWindow()
 		})
 	}
 
-	// Build init script
+	// Build init script (notification script is included if enabled)
 	initScript := buildInitScript(cfg)
 	w.Init(initScript)
 
-	// Start notification click checker if notifications are enabled
+	// Start notification click checker
 	if cfg.EnableNotification {
 		go func() {
 			ticker := time.NewTicker(500 * time.Millisecond)
@@ -368,6 +420,7 @@ func runWebView() {
 
 	// Navigate
 	w.Navigate(cfg.URL)
+
 	w.Run()
 
 	// After webview closes
@@ -455,7 +508,35 @@ func showMainWindow() {
 		}
 	}
 
-	procSetForegroundWindow.Call(mainHwnd)
+	// Force bring window to foreground
+	bringWindowToFront(mainHwnd)
+}
+
+// bringWindowToFront forces window to foreground using multiple techniques
+func bringWindowToFront(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+
+	// Get current foreground window's thread
+	foregroundHwnd, _, _ := procGetForegroundWindow.Call()
+	foregroundThread, _, _ := procGetWindowThreadProcessId.Call(foregroundHwnd, 0)
+	currentThread, _, _ := procGetCurrentThreadId.Call()
+
+	// Attach to foreground thread to allow SetForegroundWindow
+	if foregroundThread != currentThread {
+		procAttachThreadInput.Call(currentThread, foregroundThread, 1)       // Attach
+		defer procAttachThreadInput.Call(currentThread, foregroundThread, 0) // Detach
+	}
+
+	// Bring window to top
+	procBringWindowToTop.Call(hwnd)
+
+	// Set as foreground window
+	procSetForegroundWindow.Call(hwnd)
+
+	// Also set focus
+	procSetFocus.Call(hwnd)
 }
 
 func hideMainWindow() {
@@ -852,15 +933,30 @@ func showNativeNotification(title, body, iconURL, notifId, tag string) {
 		return
 	}
 
+	debugLog("showNativeNotification: title=%s, body=%s, notifId=%s, AUMID=%s", title, body, notifId, appUserModelID)
+
 	if title == "" {
 		title = appTitle
 	}
 
+	// Ensure AUMID is set
+	if appUserModelID == "" {
+		appUserModelID = generateAppUserModelID(appTitle)
+		debugLog("Generated AUMID: %s", appUserModelID)
+	}
+
+	// Build activation URL using custom protocol
+	// When user clicks toast, Windows will launch: w2app://notification?id=123
+	activationArgs := fmt.Sprintf("w2app://notification?id=%s", notifId)
+	debugLog("ActivationArguments: %s", activationArgs)
+
 	notification := toast.Notification{
-		AppID:   appUserModelID, // Use the registered AppUserModelID
-		Title:   title,
-		Message: body,
-		Audio:   toast.Default,
+		AppID:               appUserModelID,
+		Title:               title,
+		Message:             body,
+		Audio:               toast.Default,
+		ActivationType:      "protocol", // IMPORTANT: Use "protocol" for URL activation
+		ActivationArguments: activationArgs,
 	}
 
 	// Try to set icon - extract from exe if not already done
@@ -871,20 +967,15 @@ func showNativeNotification(title, body, iconURL, notifId, tag string) {
 		notification.Icon = notificationIconPath
 	}
 
-	// Set activation to open the app when notification is clicked
-	exePath, err := os.Executable()
-	if err == nil {
-		notification.ActivationType = "protocol"
-		if notifId != "" {
-			notification.ActivationArguments = fmt.Sprintf(`"%s" --show --notif-id=%s`, exePath, notifId)
-		} else {
-			notification.ActivationArguments = fmt.Sprintf(`"%s" --show`, exePath)
-		}
-	}
+	debugLog("Pushing notification with AppID=%s, Icon=%s, ActivationType=foreground, ActivationArgs=%s", appUserModelID, notificationIconPath, activationArgs)
+
+	// Save pending notification - this will be read when toast is clicked and app relaunches
+	savePendingNotification(appTitle, notifId)
 
 	if err := notification.Push(); err != nil {
-		// Log error for debugging
-		fmt.Fprintf(os.Stderr, "Toast error: %v (AppID: %s)\n", err, appUserModelID)
+		debugLog("Toast error: %v", err)
+	} else {
+		debugLog("Notification pushed successfully!")
 	}
 }
 
@@ -929,6 +1020,17 @@ func sanitizeFileName(name string) string {
 	return result
 }
 
+// debugLog writes debug messages to a temp file
+func debugLog(format string, args ...interface{}) {
+	logFile, err := os.OpenFile(filepath.Join(os.TempDir(), "w2app-debug.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer logFile.Close()
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(logFile, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
+}
+
 func buildInitScript(cfg *config.AppConfig) string {
 	var scripts []string
 
@@ -961,24 +1063,39 @@ func buildInitScript(cfg *config.AppConfig) string {
 		`)
 	}
 
-	// Override Notification API if enabled
+	// Add script to intercept notifications and show native toast with app icon
+	// Suppress WebView2 native notification, only use go-toast
 	if cfg.EnableNotification {
 		scripts = append(scripts, `
 			(function() {
-				// Store pending notifications for click handling
+				var OriginalNotification = window.Notification;
 				var pendingNotifications = {};
 				var notificationId = 0;
-
-				// Expose function to handle notification click from native
+				
 				window._w2appHandleNotificationClick = function(id) {
-					console.log('[W2App] Notification click handler called with id:', id);
-					var notification = pendingNotifications[id];
-					if (notification && typeof notification.onclick === 'function') {
-						notification.onclick({ target: notification });
+					var data = pendingNotifications[id];
+					if (data) {
+						if (typeof window.w2appFocusWindow === 'function') {
+							window.w2appFocusWindow();
+						}
+						if (typeof data.onclick === 'function') {
+							try {
+								data.onclick.call(data.self, { target: data.self });
+							} catch(e) {}
+						}
+						if (data.self && typeof data.self.dispatchEvent === 'function') {
+							try {
+								data.self.dispatchEvent(new Event('click'));
+							} catch(e) {}
+						}
+					} else {
+						if (typeof window.w2appFocusWindow === 'function') {
+							window.w2appFocusWindow();
+						}
 					}
 					delete pendingNotifications[id];
 				};
-
+				
 				function W2AppNotification(title, options) {
 					options = options || {};
 					var self = this;
@@ -989,78 +1106,69 @@ func buildInitScript(cfg *config.AppConfig) string {
 					this.icon = options.icon || '';
 					this.tag = options.tag || '';
 					this.data = options.data || null;
-					this.onclick = null;
-					this.onclose = null;
-					this.onerror = null;
-					this.onshow = null;
+					this.silent = true;
 					this._id = id;
-
-					// Store for later click handling
-					pendingNotifications[id] = this;
-
-					// Show native notification
-					console.log('[W2App] Showing notification:', title, this.body);
-					try {
-						_w2appShowNotification(title, this.body, this.icon, id.toString(), this.tag);
-					} catch(e) {
-						console.error('[W2App] Notification error:', e);
+					
+					var onclickHandler = null;
+					Object.defineProperty(this, 'onclick', {
+						get: function() { return onclickHandler; },
+						set: function(fn) {
+							onclickHandler = fn;
+							if (pendingNotifications[id]) {
+								pendingNotifications[id].onclick = fn;
+							}
+						}
+					});
+					
+					pendingNotifications[id] = {
+						self: this,
+						title: title,
+						body: options.body || '',
+						tag: options.tag || '',
+						onclick: null
+					};
+					
+					if (typeof window.w2appNotify === 'function') {
+						window.w2appNotify(title, options.body || '', options.icon || '', id.toString(), options.tag || '');
 					}
-
+					
 					setTimeout(function() {
-						if (typeof self.onshow === 'function') self.onshow();
+						if (typeof self.onshow === 'function') {
+							self.onshow();
+						}
 					}, 100);
-
-					// Auto cleanup after 30 seconds
+					
 					setTimeout(function() {
 						delete pendingNotifications[id];
-					}, 30000);
+					}, 300000);
 				}
+				
+				W2AppNotification.prototype.close = function() {
+					delete pendingNotifications[this._id];
+					if (typeof this.onclose === 'function') {
+						this.onclose();
+					}
+				};
+				W2AppNotification.prototype.addEventListener = function(type, handler) {
+					if (type === 'click' && pendingNotifications[this._id]) {
+						pendingNotifications[this._id].onclick = handler;
+					}
+				};
+				W2AppNotification.prototype.removeEventListener = function() {};
+				W2AppNotification.prototype.dispatchEvent = function(event) {
+					if (event.type === 'click' && typeof this.onclick === 'function') {
+						this.onclick.call(this, event);
+					}
+				};
+				
 				W2AppNotification.permission = 'granted';
 				W2AppNotification.maxActions = 2;
 				W2AppNotification.requestPermission = function(callback) {
-					var promise = Promise.resolve('granted');
 					if (callback) callback('granted');
-					return promise;
+					return Promise.resolve('granted');
 				};
-				W2AppNotification.prototype.close = function() {
-					delete pendingNotifications[this._id];
-					if (typeof this.onclose === 'function') this.onclose();
-				};
+				
 				window.Notification = W2AppNotification;
-
-				// Handle service worker notifications
-				if (navigator.serviceWorker) {
-					var originalRegister = navigator.serviceWorker.register;
-					navigator.serviceWorker.register = function() {
-						return originalRegister.apply(this, arguments).then(function(registration) {
-							if (registration) {
-								registration.showNotification = function(title, options) {
-									options = options || {};
-									var id = ++notificationId;
-									var notification = {
-										title: title,
-										body: options.body || '',
-										icon: options.icon || '',
-										tag: options.tag || '',
-										data: options.data || null,
-										_id: id
-									};
-									pendingNotifications[id] = notification;
-									
-									console.log('[W2App] SW Showing notification:', title);
-									try {
-										_w2appShowNotification(title, options.body || '', options.icon || '', id.toString(), options.tag || '');
-									} catch(e) {
-										console.error('[W2App] SW Notification error:', e);
-									}
-									return Promise.resolve();
-								};
-							}
-							return registration;
-						});
-					};
-				}
-				console.log('[W2App] Native notifications enabled');
 			})();
 		`)
 	}
@@ -1079,7 +1187,7 @@ func buildInitScript(cfg *config.AppConfig) string {
 	if cfg.InjectJS != "" {
 		scripts = append(scripts, fmt.Sprintf(`
 			(function() {
-				try { %s } catch(e) { console.error('Injected JS error:', e); }
+				try { %s } catch(e) {}
 			})();
 		`, cfg.InjectJS))
 	}
@@ -1133,6 +1241,131 @@ func buildInitScript(cfg *config.AppConfig) string {
 	}
 
 	return strings.Join(scripts, "\n")
+}
+
+// getNotificationScript returns the notification override script
+func getNotificationScript() string {
+	return `
+		(function() {
+			if (window._w2appNotificationInitialized) return;
+			window._w2appNotificationInitialized = true;
+			
+			var pendingNotifications = window._w2appPendingNotifications || {};
+			window._w2appPendingNotifications = pendingNotifications;
+			var notificationId = window._w2appNotificationId || 0;
+
+			function callNativeNotification(title, body, icon, id, tag) {
+				try {
+					if (typeof window.w2appNotify === 'function') {
+						window.w2appNotify(title || '', body || '', icon || '', id || '', tag || '').catch(function(){});
+					}
+				} catch(e) {}
+			}
+
+			window._w2appHandleNotificationClick = function(id) {
+				var n = pendingNotifications[id];
+				if (n) {
+					var handled = false;
+					if (typeof n.onclick === 'function') {
+						try {
+							var event = {
+								target: n,
+								currentTarget: n,
+								type: 'click',
+								preventDefault: function() {},
+								stopPropagation: function() {}
+							};
+							n.onclick.call(n, event);
+							handled = true;
+						} catch(e) {}
+					}
+					if (!handled && n.data && n.data.url) {
+						window.location.href = n.data.url;
+						handled = true;
+					}
+					if (!handled && n._fromServiceWorker) {
+						var customEvent = new CustomEvent('w2app-notification-click', {
+							detail: { title: n.title, body: n.body, tag: n.tag, data: n.data }
+						});
+						window.dispatchEvent(customEvent);
+						if (typeof n.close === 'function') n.close();
+					}
+				}
+				delete pendingNotifications[id];
+			};
+
+			window._w2appTestNotification = function(title, body) {
+				title = title || 'Test Notification';
+				body = body || 'This is a test notification from W2App';
+				callNativeNotification(title, body, '', '0', '');
+			};
+
+			function W2AppNotification(title, options) {
+				options = options || {};
+				var self = this;
+				var id = ++notificationId;
+				window._w2appNotificationId = notificationId;
+				
+				this.title = title;
+				this.body = options.body || '';
+				this.icon = options.icon || '';
+				this.tag = options.tag || '';
+				this.data = options.data || null;
+				this.onclick = null;
+				this.onclose = null;
+				this.onerror = null;
+				this.onshow = null;
+				this._id = id;
+				this._fromServiceWorker = false;
+
+				pendingNotifications[id] = this;
+				
+				var onclickValue = null;
+				Object.defineProperty(this, 'onclick', {
+					get: function() { return onclickValue; },
+					set: function(fn) { onclickValue = fn; }
+				});
+				
+				callNativeNotification(title, this.body, this.icon, id.toString(), this.tag);
+				setTimeout(function() { if (typeof self.onshow === 'function') self.onshow(); }, 100);
+				setTimeout(function() { delete pendingNotifications[id]; }, 30000);
+			}
+			W2AppNotification.permission = 'granted';
+			W2AppNotification.maxActions = 2;
+			W2AppNotification.requestPermission = function(cb) {
+				if (cb) cb('granted');
+				return Promise.resolve('granted');
+			};
+			W2AppNotification.prototype.close = function() {
+				delete pendingNotifications[this._id];
+				if (typeof this.onclose === 'function') this.onclose();
+			};
+			
+			window.Notification = W2AppNotification;
+
+			if (navigator.serviceWorker) {
+				ServiceWorkerRegistration.prototype.showNotification = function(title, options) {
+					options = options || {};
+					var id = ++notificationId;
+					window._w2appNotificationId = notificationId;
+					
+					var notif = { 
+						title: title, 
+						body: options.body || '', 
+						icon: options.icon || '',
+						tag: options.tag || '',
+						data: options.data || null,
+						_id: id,
+						_fromServiceWorker: true,
+						close: function() {}
+					};
+					pendingNotifications[id] = notif;
+					callNativeNotification(title, options.body || '', options.icon || '', id.toString(), options.tag || '');
+					return Promise.resolve();
+				};
+			}
+		})();
+	`
 }
 
 func escapeJS(s string) string {
@@ -1333,34 +1566,89 @@ func setTitleBarColor(hwnd uintptr, colorStr string) {
 // sendNotificationClick writes notification ID to a temp file for the main instance to read
 func sendNotificationClick(appName, notifId string) {
 	notifFile := filepath.Join(os.TempDir(), fmt.Sprintf("w2app-%s-notif.txt", sanitizeFileName(appName)))
+	debugLog("sendNotificationClick: writing notifId=%s to %s", notifId, notifFile)
 	os.WriteFile(notifFile, []byte(notifId), 0644)
 }
 
-// checkNotificationClick checks if there's a pending notification click and handles it
+// savePendingNotification saves the notification ID when a toast is shown
+// This will be read when the toast is clicked and app is relaunched
+func savePendingNotification(appName, notifId string) {
+	pendingFile := filepath.Join(os.TempDir(), fmt.Sprintf("w2app-%s-pending.txt", sanitizeFileName(appName)))
+	debugLog("savePendingNotification: saving notifId=%s to %s", notifId, pendingFile)
+	os.WriteFile(pendingFile, []byte(notifId), 0644)
+}
+
+// handlePendingNotificationClick checks for pending notification and sends click to main instance
+func handlePendingNotificationClick(appName string) {
+	pendingFile := filepath.Join(os.TempDir(), fmt.Sprintf("w2app-%s-pending.txt", sanitizeFileName(appName)))
+	data, err := os.ReadFile(pendingFile)
+	if err != nil {
+		debugLog("handlePendingNotificationClick: no pending file found")
+		return
+	}
+
+	// Remove the pending file
+	os.Remove(pendingFile)
+
+	notifId := strings.TrimSpace(string(data))
+	if notifId == "" {
+		debugLog("handlePendingNotificationClick: pending file empty")
+		return
+	}
+
+	debugLog("handlePendingNotificationClick: found pending notifId=%s, sending click", notifId)
+	sendNotificationClick(appName, notifId)
+}
+
+// checkNotificationClick checks if there's a notification click signal from a relaunched instance
+// The flow is:
+// 1. User clicks toast -> Windows relaunches app (or tries to)
+// 2. Second instance detects main instance running, reads pending file, writes to notif file
+// 3. Main instance polls notif file here and handles the click
+// IMPORTANT: We ONLY process the notif file (written by 2nd instance), NOT the pending file directly
+// The pending file is just storage for the notifId - we don't auto-show when it's created
 func checkNotificationClick() {
 	if mainWindow == nil {
 		return
 	}
 
+	// Only check the notif file (signal from relaunched instance that toast was clicked)
 	notifFile := filepath.Join(os.TempDir(), fmt.Sprintf("w2app-%s-notif.txt", sanitizeFileName(appTitle)))
 	data, err := os.ReadFile(notifFile)
 	if err != nil {
+		// No notif file means no toast was clicked
 		return
 	}
 
-	// Remove the file
+	// Remove the file immediately to prevent re-processing
 	os.Remove(notifFile)
 
 	notifId := strings.TrimSpace(string(data))
 	if notifId == "" {
+		debugLog("checkNotificationClick: notif file was empty")
 		return
 	}
+
+	debugLog("checkNotificationClick: found notif file, notifId=%s", notifId)
+
+	// Show window first (toast was clicked, so user wants to see the app)
+	showMainWindow()
 
 	// Execute JavaScript to handle notification click
 	mainWindow.Dispatch(func() {
 		js := fmt.Sprintf("if(window._w2appHandleNotificationClick) window._w2appHandleNotificationClick(%s);", notifId)
+		debugLog("checkNotificationClick: executing JS: %s", js)
 		mainWindow.Eval(js)
 	})
+}
+
+// isWindowVisible checks if the main window is currently visible
+func isWindowVisible() bool {
+	if mainHwnd == 0 {
+		return false
+	}
+	ret, _, _ := procIsWindowVisible.Call(mainHwnd)
+	return ret != 0
 }
 
 // Registry key for Windows startup
@@ -1440,47 +1728,106 @@ func setProcessAppUserModelID(aumid string) {
 	procSetCurrentProcessExplicitAppUserModelID.Call(uintptr(unsafe.Pointer(aumidPtr)))
 }
 
+// registerProtocol registers custom URL protocol for toast activation
+func registerProtocol(protocol, exePath string) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+
+	debugLog("registerProtocol: registering %s:// protocol", protocol)
+
+	// Open/create protocol key
+	key, _, err := registry.CreateKey(registry.CURRENT_USER,
+		fmt.Sprintf(`Software\Classes\%s`, protocol),
+		registry.ALL_ACCESS)
+	if err != nil {
+		return fmt.Errorf("failed to create protocol key: %w", err)
+	}
+	defer key.Close()
+
+	// Set default value and URL Protocol marker
+	if err := key.SetStringValue("", fmt.Sprintf("URL:%s Protocol", protocol)); err != nil {
+		return err
+	}
+	if err := key.SetStringValue("URL Protocol", ""); err != nil {
+		return err
+	}
+
+	// Create command key
+	cmdKey, _, err := registry.CreateKey(registry.CURRENT_USER,
+		fmt.Sprintf(`Software\Classes\%s\shell\open\command`, protocol),
+		registry.ALL_ACCESS)
+	if err != nil {
+		return fmt.Errorf("failed to create command key: %w", err)
+	}
+	defer cmdKey.Close()
+
+	// Set command with quoted path and %1 for URL argument
+	command := fmt.Sprintf(`"%s" "%%1"`, exePath)
+	if err := cmdKey.SetStringValue("", command); err != nil {
+		return err
+	}
+
+	debugLog("registerProtocol: successfully registered %s:// -> %s", protocol, command)
+	return nil
+}
+
 // ensureStartMenuShortcut creates Start Menu shortcut with AppUserModelID for toast notifications
 func ensureStartMenuShortcut() error {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
 
+	debugLog("ensureStartMenuShortcut: starting...")
+
 	exePath, err := os.Executable()
 	if err != nil {
+		debugLog("ensureStartMenuShortcut: failed to get exe path: %v", err)
 		return err
 	}
+	debugLog("ensureStartMenuShortcut: exePath=%s", exePath)
 
 	// Get Start Menu Programs folder path
 	var pathPtr *uint16
-	ret, _, _ := procSHGetKnownFolderPath.Call(
+	ret, _, lastErr := procSHGetKnownFolderPath.Call(
 		uintptr(unsafe.Pointer(&FOLDERID_Programs)),
 		0,
 		0,
 		uintptr(unsafe.Pointer(&pathPtr)),
 	)
 	if ret != 0 {
-		return fmt.Errorf("failed to get Start Menu path")
+		debugLog("ensureStartMenuShortcut: SHGetKnownFolderPath failed: ret=%x, err=%v", ret, lastErr)
+		return fmt.Errorf("failed to get Start Menu path: %x", ret)
 	}
 	programsPath := syscall.UTF16ToString((*[260]uint16)(unsafe.Pointer(pathPtr))[:])
+	debugLog("ensureStartMenuShortcut: programsPath=%s", programsPath)
 
 	// Free the path memory
 	syscall.NewLazyDLL("ole32.dll").NewProc("CoTaskMemFree").Call(uintptr(unsafe.Pointer(pathPtr)))
 
 	shortcutPath := filepath.Join(programsPath, sanitizeFileName(appTitle)+".lnk")
+	debugLog("ensureStartMenuShortcut: shortcutPath=%s", shortcutPath)
 
-	// Check if shortcut already exists
-	if _, err := os.Stat(shortcutPath); err == nil {
-		return nil // Already exists
+	// Check if shortcut exists and is recent (within 7 days)
+	// If old, delete and recreate to ensure protocol support
+	if info, err := os.Stat(shortcutPath); err == nil {
+		if time.Since(info.ModTime()) < 7*24*time.Hour {
+			debugLog("ensureStartMenuShortcut: shortcut already exists and is recent")
+			return nil
+		}
+		// Old shortcut, delete and recreate
+		os.Remove(shortcutPath)
+		debugLog("ensureStartMenuShortcut: removed old shortcut, will recreate")
 	}
 
 	// Initialize COM
-	procCoInitializeEx.Call(0, 0)
+	ret, _, lastErr = procCoInitializeEx.Call(0, 0)
+	debugLog("ensureStartMenuShortcut: CoInitializeEx ret=%x, err=%v", ret, lastErr)
 	defer procCoUninitialize.Call()
 
 	// Create ShellLink object
 	var shellLink uintptr
-	ret, _, _ = procCoCreateInstance.Call(
+	ret, _, lastErr = procCoCreateInstance.Call(
 		uintptr(unsafe.Pointer(&CLSID_ShellLink)),
 		0,
 		1, // CLSCTX_INPROC_SERVER
@@ -1488,14 +1835,17 @@ func ensureStartMenuShortcut() error {
 		uintptr(unsafe.Pointer(&shellLink)),
 	)
 	if ret != 0 {
+		debugLog("ensureStartMenuShortcut: CoCreateInstance failed: ret=%x, err=%v", ret, lastErr)
 		return fmt.Errorf("failed to create ShellLink: %x", ret)
 	}
+	debugLog("ensureStartMenuShortcut: ShellLink created: %x", shellLink)
 	defer releaseComObject(shellLink)
 
 	// Set shortcut target path
 	setPath := getVTableProc(shellLink, 20) // IShellLinkW::SetPath
 	exePathPtr, _ := syscall.UTF16PtrFromString(exePath)
-	syscall.SyscallN(setPath, shellLink, uintptr(unsafe.Pointer(exePathPtr)))
+	ret, _, _ = syscall.SyscallN(setPath, shellLink, uintptr(unsafe.Pointer(exePathPtr)))
+	debugLog("ensureStartMenuShortcut: SetPath ret=%x", ret)
 
 	// Set description
 	setDescription := getVTableProc(shellLink, 7) // IShellLinkW::SetDescription
@@ -1515,7 +1865,8 @@ func ensureStartMenuShortcut() error {
 	// Get IPropertyStore interface to set AppUserModelID
 	var propStore uintptr
 	queryInterface := getVTableProc(shellLink, 0) // QueryInterface
-	ret, _, _ = syscall.SyscallN(queryInterface, shellLink, uintptr(unsafe.Pointer(&IID_IPropertyStore)), uintptr(unsafe.Pointer(&propStore)))
+	ret, _, lastErr = syscall.SyscallN(queryInterface, shellLink, uintptr(unsafe.Pointer(&IID_IPropertyStore)), uintptr(unsafe.Pointer(&propStore)))
+	debugLog("ensureStartMenuShortcut: QueryInterface(IPropertyStore) ret=%x, propStore=%x, err=%v", ret, propStore, lastErr)
 	if ret == 0 && propStore != 0 {
 		defer releaseComObject(propStore)
 
@@ -1526,29 +1877,35 @@ func ensureStartMenuShortcut() error {
 		propVar.ptr = uintptr(unsafe.Pointer(aumidPtr))
 
 		setValue := getVTableProc(propStore, 6) // IPropertyStore::SetValue
-		syscall.SyscallN(setValue, propStore, uintptr(unsafe.Pointer(&PKEY_AppUserModel_ID)), uintptr(unsafe.Pointer(&propVar)))
+		ret, _, _ = syscall.SyscallN(setValue, propStore, uintptr(unsafe.Pointer(&PKEY_AppUserModel_ID)), uintptr(unsafe.Pointer(&propVar)))
+		debugLog("ensureStartMenuShortcut: SetValue(AUMID=%s) ret=%x", appUserModelID, ret)
 
 		// Commit changes
 		commit := getVTableProc(propStore, 7) // IPropertyStore::Commit
-		syscall.SyscallN(commit, propStore)
+		ret, _, _ = syscall.SyscallN(commit, propStore)
+		debugLog("ensureStartMenuShortcut: Commit ret=%x", ret)
 	}
 
 	// Get IPersistFile interface and save
 	var persistFile uintptr
-	ret, _, _ = syscall.SyscallN(queryInterface, shellLink, uintptr(unsafe.Pointer(&IID_IPersistFile)), uintptr(unsafe.Pointer(&persistFile)))
+	ret, _, lastErr = syscall.SyscallN(queryInterface, shellLink, uintptr(unsafe.Pointer(&IID_IPersistFile)), uintptr(unsafe.Pointer(&persistFile)))
 	if ret != 0 {
+		debugLog("ensureStartMenuShortcut: QueryInterface(IPersistFile) failed: ret=%x, err=%v", ret, lastErr)
 		return fmt.Errorf("failed to get IPersistFile: %x", ret)
 	}
+	debugLog("ensureStartMenuShortcut: IPersistFile obtained: %x", persistFile)
 	defer releaseComObject(persistFile)
 
 	// Save the shortcut
 	save := getVTableProc(persistFile, 6) // IPersistFile::Save
 	shortcutPathPtr, _ := syscall.UTF16PtrFromString(shortcutPath)
-	ret, _, _ = syscall.SyscallN(save, persistFile, uintptr(unsafe.Pointer(shortcutPathPtr)), 1) // TRUE = remember
+	ret, _, lastErr = syscall.SyscallN(save, persistFile, uintptr(unsafe.Pointer(shortcutPathPtr)), 1) // TRUE = remember
 	if ret != 0 {
+		debugLog("ensureStartMenuShortcut: Save failed: ret=%x, err=%v", ret, lastErr)
 		return fmt.Errorf("failed to save shortcut: %x", ret)
 	}
 
+	debugLog("ensureStartMenuShortcut: shortcut created successfully at %s", shortcutPath)
 	return nil
 }
 

@@ -69,13 +69,15 @@ Download `w2app.exe` dari [Releases](https://github.com/user/w2app/releases).
 git clone https://github.com/user/w2app.git
 cd w2app
 
-# Build (Windows)
-build.bat
+# Build menggunakan vendor (WAJIB - ada patch lokal di vendor)
+go build -mod=vendor -ldflags="-s -w -H windowsgui" -o internal/generator/stubs/stub-windows-amd64.exe ./cmd/stub
+go build -mod=vendor -ldflags="-s -w" -o w2app.exe ./cmd/w2app
 
-# Atau manual:
-go build -ldflags="-s -w -H windowsgui" -o internal/generator/stubs/stub-windows-amd64.exe ./cmd/stub
-go build -ldflags="-s -w" -o w2app.exe ./cmd/w2app
+# Atau gunakan build.bat (Windows)
+build.bat
 ```
+
+> **Note**: Project ini menggunakan vendored dependencies dengan patch lokal pada `go-webview2` untuk fix permission handling. Selalu gunakan `-mod=vendor` saat build.
 
 ## Quick Start
 
@@ -267,8 +269,9 @@ W2App menggunakan arsitektur "stub-based packaging":
 1. App generates unique AppUserModelID (AUMID): `W2App.{AppName}`
 2. App creates Start Menu shortcut with AUMID on first run
 3. JS injection overrides `Notification` API in webpage
-4. When page calls `new Notification()`, native Windows toast is shown
-5. Toast click brings app to foreground
+4. When page calls `new Notification()`, native Windows toast is shown via go-toast
+5. Toast click triggers protocol URL (`w2app://notification?id=X`)
+6. App handles protocol, triggers stored onclick handler, and focuses window
 
 ## Output
 
